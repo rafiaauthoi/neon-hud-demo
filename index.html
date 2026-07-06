@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Neon HUD Demo</title>
+  <script src="https://cdn.jsdelivr.net/npm/tone@14.8.49/build/Tone.js"></script>
+  <style>
+    body {
+      background-color: #050505;
+      color: #eaeaea;
+      font-family: monospace;
+      text-align: center;
+      padding-top: 30px;
+      margin: 0;
+    }
+
+    h1 {
+      color: #ff2fb0;
+      text-shadow: 0 0 12px #ff2fb0;
+      letter-spacing: 2px;
+    }
+
+    #startButton {
+      margin-top: 10px;
+      background-color: #ff2fb0;
+      color: #0a0a0a;
+      border: none;
+      padding: 12px 24px;
+      font-family: monospace;
+      font-size: 14px;
+      font-weight: bold;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+
+    #startButton:hover {
+      background-color: #ff5fc4;
+    }
+
+    #video-wrapper {
+      position: relative;
+      width: 80vw;
+      max-width: 1100px;
+      aspect-ratio: 4 / 3;
+      margin: 20px auto 0;
+      border: 2px solid #ff2fb0;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 0 30px rgba(255, 47, 176, 0.4);
+      background-color: #000;
+    }
+
+    video {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      transform: scaleX(-1);
+      opacity: 0.55;
+    }
+
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      transform: scaleX(-1);
+    }
+
+    #hud-flash {
+      position: absolute;
+      top: 3%;
+      left: 0;
+      width: 100%;
+      text-align: center;
+      color: #7fffd4;
+      font-size: min(4vw, 32px);
+      font-weight: bold;
+      text-shadow: 0 0 14px #7fffd4;
+      opacity: 0;
+      transition: opacity 0.15s ease;
+      pointer-events: none;
+    }
+
+    #full-flash {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background-color: rgba(255, 255, 255, 0.85);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.5s ease;
+    }
+
+    #status {
+      margin-top: 14px;
+      font-size: 14px;
+      color: #888;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>NEON HUD</h1>
+  <button id="startButton">Start Demo</button>
+
+  <div id="video-wrapper">
+    <video id="webcam" autoplay playsinline></video>
+    <canvas id="overlay" width="1280" height="960"></canvas>
+    <div id="hud-flash">TARGET ACQUIRED</div>
+    <div id="full-flash"></div>
+  </div>
+  <p id="status">Click "Start Demo" to begin.</p>
+
+  <script type="module">
+    import {
+      HandLandmarker,
+      FilesetResolver
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+    const video = document.getElementById('webcam');
+    const canvas = document.getElementById('overlay');
+    const ctx = canvas.getContext('2d');
+    const status = document.getElementById('status');
+    const startButton = document.getElementById('startButton');
+    const hudFlash = document.getElementById('hud-flash');
+    const fullFlash = document.getElementById('full-flash');
+
+    const FINGERTIP_INDICES = [4, 8, 12, 16, 20];
+    const PINCH_DISTANCE_THRESHOLD = 0.045;
+    const CHARGE_FULL_THRESHOLD = 0.8;
+    const CHARGE_BUFFER = 0.1;
+    const CHARGE_HOLD_MS = 500;
+    const COMBO_WINDOW_MS = 500;
+
+    // CUSTOMIZE THE MUSIC HERE: any Tone.js note names, in any order, any length.
+    const SCALE = ['C4', 'D4', 'E4', 'G4', 'A4', 'C5', 'D5', 'E5', 'G5', 'A5'];
+
+    const HAND_CONNECTIONS = [
+      [0, 1], [1, 2], [2, 3], [3, 4],
+      [0, 5], [5, 6], [6, 7], [7, 8],
+      [5, 9], [9, 10], [10, 11], [11, 12],
+      [9, 13], [13, 14], [14, 15], [15, 16],
+      [13, 17], [17, 18], [18, 19], [19, 20],
+      [0, 17]
+    ];
+
+    let handLandmarker;
+    let wasHandPresent = false;
+    let wasPinching = [false, false];
+    let pulses = [];
+    let burstParticles = [];
+    let chargeStartTime = null;
+    let chargeReleased = false;
+    let pinchStartTimestamps = [null, null];
+
+    let melodySynths = [null, null];
+    let lastNoteIndex = [null, null];
+    let pinchSynth, comboSynth, chargeSynth;
+
+    const particles = [];
+    for (let i = 0; i < 35; i++) {
+      particles.push({
+        x: Math.random() * canvas.width,
+        y: Math.random() * canvas.height,
+        radius: Math.random() * 2.5 + 1,
+        angle: Math.random() * Math.PI * 2,
+        speed: Math.random() * 0.3 + 0.1,
+        pulseOffset: Math.random() * Math.PI * 2
+      });
+    }
+
+    startButton.addEventListener('click', async () => {
+      await Tone.start();
+
+      melodySynths[0] = new Tone.Synth({ oscillator: { type: 'sine' } }).toDestination();
+      melodySynths[0].volume.value = -12;
+      melodySynths[1] = new Tone.Synth({ oscillator: { type: 'sine' } }).toDestination();
+      melodySynths[1].volume.value = -12;
+
+      // softer accent sounds: sine wave, lower octave, gentle envelope so nothing clicks or pierces
+      pinchSynth = new Tone.Synth({
+        oscillator: { type: 'sine' },
+        envelope: { attack: 0.02, decay: 0.1, sustain: 0.2, release: 0.3 }
+      }).toDestination();
+      pinchSynth.volume.value = -10;
+
+      comboSynth = new Tone.PolySynth(Tone.Synth, {
+        oscillator: { type: 'sine' },
+        envelope: { attack: 0.03, decay: 0.15, sustain: 0.2, release: 0.4 }
+      }).toDestination();
+      comboSynth.volume.value = -10;
+
+      chargeSynth = new Tone.Synth({
+        oscillator: { type: 'sine' },
+        envelope: { attack: 0.03, decay: 0.2, sustain: 0.3, release: 0.5 }
+      }).toDestination();
+      chargeSynth.volume.value = -8;
+
+      startButton.textContent = "Demo Running";
+      startButton.disabled = true;
+      status.textContent = "Loading tracking model...";
+
+      setupHandLandmarker();
+    });
+
+    async function setupHandLandmarker() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+
+      handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 2
+      });
+
+      status.textContent = "Model loaded. Starting camera...";
+      startWebcam();
+    }
+
+    async function startWebcam() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false
+        });
+        video.srcObject = stream;
+
+        video.addEventListener('loadeddata', () => {
+          status.textContent = "Live. Step in front of the camera.";
+          animationLoop();
+        });
+      } catch (error) {
+        status.textContent = "Camera access failed: " + error.message;
+      }
+    }
+
+    function getDistance(pointA, pointB) {
+      const dx = pointA.x - pointB.x;
+      const dy = pointA.y - pointB.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    function drawGlowDot(x, y, radius, color) {
+      const pixelX = x * canvas.width;
+      const pixelY = y * canvas.height;
+
+      const gradient = ctx.createRadialGradient(pixelX, pixelY, 0, pixelX, pixelY, radius);
+      gradient.addColorStop(0, color.glow);
+      gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      ctx.fillStyle = gradient;
+      ctx.beginPath();
+      ctx.arc(pixelX, pixelY, radius, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = color.core;
+      ctx.beginPath();
+      ctx.arc(pixelX, pixelY, radius / 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    function drawHandSkeleton(hand, color) {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 8;
+
+      HAND_CONNECTIONS.forEach(([startIndex, endIndex]) => {
+        const start = hand[startIndex];
+        const end = hand[endIndex];
+        ctx.beginPath();
+        ctx.moveTo(start.x * canvas.width, start.y * canvas.height);
+        ctx.lineTo(end.x * canvas.width, end.y * canvas.height);
+        ctx.stroke();
+      });
+
+      ctx.shadowBlur = 0;
+    }
+
+    function drawUnmirroredText(text, x, y, color, fontSize) {
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.scale(-1, 1);
+      ctx.fillStyle = color;
+      ctx.font = fontSize + 'px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(text, 0, 0);
+      ctx.restore();
+    }
+
+    function drawScanRing(time) {
+      const centerX = canvas.width / 2;
+      const centerY = canvas.height / 2;
+      const baseRadius = canvas.width * 0.12;
+
+      for (let i = 0; i < 3; i++) {
+        const pulse = (time / 1000 + i * 0.6) % 2;
+        const radius = pulse * baseRadius;
+        const alpha = Math.max(0, 1 - pulse / 2);
+        ctx.strokeStyle = `rgba(255, 47, 176, ${alpha * 0.5})`;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      const angle = time / 800;
+      ctx.strokeStyle = 'rgba(127, 255, 212, 0.8)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(centerX, centerY);
+      ctx.lineTo(centerX + Math.cos(angle) * baseRadius * 0.75, centerY + Math.sin(angle) * baseRadius * 0.75);
+      ctx.stroke();
+
+      drawUnmirroredText('STANDBY', centerX, centerY + baseRadius * 1.2, 'rgba(127, 255, 212, 0.9)', canvas.width * 0.014);
+    }
+
+    function drawIdleParticles(time) {
+      particles.forEach((p) => {
+        p.x += Math.cos(p.angle) * p.speed;
+        p.y += Math.sin(p.angle) * p.speed;
+
+        if (p.x < 0) p.x = canvas.width;
+        if (p.x > canvas.width) p.x = 0;
+        if (p.y < 0) p.y = canvas.height;
+        if (p.y > canvas.height) p.y = 0;
+
+        const pulse = Math.sin(time / 500 + p.pulseOffset) * 0.5 + 1;
+        const displayRadius = p.radius * 4 * pulse;
+
+        drawGlowDot(p.x / canvas.width, p.y / canvas.height, displayRadius, {
+          glow: 'rgba(127, 255, 212, 0.45)',
+          core: 'rgba(127, 255, 212, 0.85)'
+        });
+      });
+    }
+
+    function drawEnergyBar(fillAmount) {
+      const barX = canvas.width * 0.03;
+      const barBottom = canvas.height - canvas.height * 0.07;
+      const barHeight = canvas.height * 0.5;
+      const barWidth = canvas.width * 0.025;
+
+      ctx.strokeStyle = 'rgba(255, 47, 176, 0.6)';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(barX, barBottom - barHeight, barWidth, barHeight);
+
+      const fillHeight = barHeight * Math.min(Math.max(fillAmount, 0), 1);
+      const gradient = ctx.createLinearGradient(0, barBottom, 0, barBottom - barHeight);
+      gradient.addColorStop(0, '#ff2fb0');
+      gradient.addColorStop(1, '#7fffd4');
+      ctx.fillStyle = gradient;
+      ctx.fillRect(barX, barBottom - fillHeight, barWidth, fillHeight);
+    }
+
+    function triggerHudFlash(message) {
+      hudFlash.textContent = message;
+      hudFlash.style.opacity = '1';
+      setTimeout(() => {
+        hudFlash.style.opacity = '0';
+      }, 700);
+    }
+
+    function triggerFullFlash() {
+      fullFlash.style.transition = 'opacity 0.05s ease';
+      fullFlash.style.opacity = '0.85';
+      setTimeout(() => {
+        fullFlash.style.transition = 'opacity 0.6s ease';
+        fullFlash.style.opacity = '0';
+      }, 60);
+    }
+
+    function spawnPulse(x, y, big) {
+      pulses.push({ x, y, radius: big ? canvas.width * 0.012 : canvas.width * 0.006, alpha: 1, speed: big ? canvas.width * 0.01 : canvas.width * 0.005 });
+    }
+
+    function drawPulses() {
+      pulses.forEach((p) => {
+        const pixelX = p.x * canvas.width;
+        const pixelY = p.y * canvas.height;
+        ctx.strokeStyle = `rgba(127, 255, 212, ${p.alpha})`;
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(pixelX, pixelY, p.radius, 0, Math.PI * 2);
+        ctx.stroke();
+
+        p.radius += p.speed;
+        p.alpha -= 0.03;
+      });
+      pulses = pulses.filter((p) => p.alpha > 0);
+    }
+
+    function spawnBurst(x, y, count, colorCore) {
+      for (let i = 0; i < count; i++) {
+        const angle = (Math.PI * 2 * i) / count + Math.random() * 0.3;
+        const speed = (Math.random() * 4 + 2) * (canvas.width / 800);
+        burstParticles.push({
+          x: x * canvas.width,
+          y: y * canvas.height,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          alpha: 1,
+          radius: (Math.random() * 3 + 2) * (canvas.width / 800),
+          color: colorCore
+        });
+      }
+    }
+
+    function drawBurstParticles() {
+      burstParticles.forEach((p) => {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.alpha -= 0.02;
+
+        ctx.fillStyle = p.color.replace('ALPHA', p.alpha.toFixed(2));
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+        ctx.fill();
+      });
+      burstParticles = burstParticles.filter((p) => p.alpha > 0);
+    }
+
+    function updateMelody(handIndex, wristY) {
+      const noteIndex = Math.floor((1 - wristY) * (SCALE.length - 1));
+      const clampedIndex = Math.min(Math.max(noteIndex, 0), SCALE.length - 1);
+
+      if (clampedIndex !== lastNoteIndex[handIndex]) {
+        melodySynths[handIndex].triggerAttack(SCALE[clampedIndex]);
+        lastNoteIndex[handIndex] = clampedIndex;
+      }
+    }
+
+    function stopMelody(handIndex) {
+      if (lastNoteIndex[handIndex] !== null) {
+        melodySynths[handIndex].triggerRelease();
+        lastNoteIndex[handIndex] = null;
+      }
+    }
+
+    function animationLoop() {
+      try {
+        const now = performance.now();
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        pinchStartTimestamps = pinchStartTimestamps.map((t) =>
+          t !== null && now - t > COMBO_WINDOW_MS ? null : t
+        );
+
+        const results = handLandmarker.detectForVideo(video, now);
+        const handsFound = results.landmarks ? results.landmarks.length : 0;
+
+        if (handsFound === 0) {
+          drawScanRing(now);
+          drawIdleParticles(now);
+          wasHandPresent = false;
+          wasPinching = [false, false];
+          chargeStartTime = null;
+          stopMelody(0);
+          stopMelody(1);
+        } else {
+          if (!wasHandPresent) {
+            triggerHudFlash('TARGET ACQUIRED');
+          }
+          wasHandPresent = true;
+
+          let highestWristY = 1;
+
+          results.landmarks.forEach((hand, handIndex) => {
+            const thumbTip = hand[4];
+            const indexTip = hand[8];
+            const wrist = hand[0];
+
+            if (wrist.y < highestWristY) {
+              highestWristY = wrist.y;
+            }
+
+            updateMelody(handIndex, wrist.y);
+
+            const pinchDistance = getDistance(thumbTip, indexTip);
+            const isPinching = pinchDistance < PINCH_DISTANCE_THRESHOLD;
+
+            const skeletonColor = isPinching
+              ? 'rgba(127, 255, 212, 0.7)'
+              : 'rgba(255, 47, 176, 0.5)';
+            drawHandSkeleton(hand, skeletonColor);
+
+            const dotColor = isPinching
+              ? { glow: 'rgba(127, 255, 212, 0.8)', core: '#7fffd4' }
+              : { glow: 'rgba(255, 47, 176, 0.8)', core: '#ff2fb0' };
+
+            FINGERTIP_INDICES.forEach((index) => {
+              const point = hand[index];
+              drawGlowDot(point.x, point.y, canvas.width * 0.0275, dotColor);
+            });
+
+            if (isPinching && !wasPinching[handIndex]) {
+              const pinchX = (thumbTip.x + indexTip.x) / 2;
+              const pinchY = (thumbTip.y + indexTip.y) / 2;
+              spawnPulse(pinchX, pinchY, false);
+              spawnBurst(pinchX, pinchY, 14, 'rgba(127, 255, 212, ALPHA)');
+              pinchSynth.triggerAttackRelease('C5', '16n');
+
+              pinchStartTimestamps[handIndex] = now;
+              const otherIndex = handIndex === 0 ? 1 : 0;
+              if (pinchStartTimestamps[otherIndex] !== null) {
+                spawnPulse(0.5, 0.5, true);
+                spawnBurst(0.5, 0.5, 40, 'rgba(255, 47, 176, ALPHA)');
+                triggerHudFlash('COMBO');
+                comboSynth.triggerAttackRelease(['C4', 'E4', 'G4'], '8n');
+                pinchStartTimestamps = [null, null];
+              }
+            }
+            wasPinching[handIndex] = isPinching;
+          });
+
+          if (handsFound === 1) {
+            stopMelody(1);
+          }
+
+          const fillAmount = 1 - highestWristY;
+          drawEnergyBar(fillAmount);
+
+          if (fillAmount >= CHARGE_FULL_THRESHOLD - (chargeStartTime !== null ? CHARGE_BUFFER : 0)) {
+            if (chargeStartTime === null) {
+              chargeStartTime = now;
+            } else if (!chargeReleased && now - chargeStartTime >= CHARGE_HOLD_MS) {
+              triggerFullFlash();
+              spawnBurst(0.5, 0.15, 50, 'rgba(255, 47, 176, ALPHA)');
+              triggerHudFlash('FULLY CHARGED');
+              chargeSynth.triggerAttackRelease('C5', '4n');
+              chargeReleased = true;
+            }
+          } else {
+            chargeStartTime = null;
+            if (fillAmount < 0.3) {
+              chargeReleased = false;
+            }
+          }
+        }
+
+        drawPulses();
+        drawBurstParticles();
+
+      } catch (error) {
+        console.error("Animation loop error:", error);
+      }
+
+      requestAnimationFrame(animationLoop);
+    }
+  </script>
+
+</body>
+</html>
