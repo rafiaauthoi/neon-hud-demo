@@ -2,6 +2,8 @@
 
 A glowing, hand tracking interactive display built for tabling and festival showcases. No touching, no controller, just a webcam and two hands.
 
+**Live demo:** https://rafiaauthoi.github.io/neon-hud-demo/c
+
 ## What it does
 
 - **Idle mode**: a pulsing scan ring and drifting ambient particles keep the screen visually alive, pulling attention from a distance when nobody is interacting.
